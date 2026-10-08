@@ -4,7 +4,7 @@ This guide covers how to install and configure the **geodata** package for local
 
 ```{important}
 This documentation describes **this repository's `main` branch**
-([sandyqian0731/geodata](https://github.com/sandyqian0731/geodata)). It carries
+([Power-Lab/geodata](https://github.com/Power-Lab/geodata)). It carries
 KULcoder's `data-pvlib-integration` work — the `pvlib`-based solar model
 (`geodata.model.pvlib`), the `geodata.mask` module, and the restructured
 `datasets/era5`, `datasets/merra2`, `datasets/hrrr` packages, none of which are
@@ -32,7 +32,7 @@ If you don't need to edit geodata's source, install this repository straight fro
 into your active environment:
 
 ```bash
-pip install --force-reinstall "geodata @ git+https://github.com/sandyqian0731/geodata.git@main"
+pip install --force-reinstall "geodata @ git+https://github.com/Power-Lab/geodata.git@main"
 ```
 
 This is the fastest path if you just want to *use* the package (e.g. from
@@ -49,10 +49,10 @@ exist there, so `geodata_helpers`' solar driver fails on import).
 To download **geodata** for local editing, open a terminal/shell window, navigate to your
 preferred working directory, and run the following. (If you do not have Git installed, you
 may also directly download the repository as a
-[zip archive](https://github.com/sandyqian0731/geodata/archive/refs/heads/main.zip).)
+[zip archive](https://github.com/Power-Lab/geodata/archive/refs/heads/main.zip).)
 
 ```bash
-git clone https://github.com/sandyqian0731/geodata.git
+git clone https://github.com/Power-Lab/geodata.git
 cd geodata
 ```
 

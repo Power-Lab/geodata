@@ -27,7 +27,6 @@ Offline: synthetic single-cell weather, real pvlib ModelChain.
 
 import numpy as np
 import pandas as pd
-import pytest
 import xarray as xr
 
 from geodata.datasets import load_dataset

@@ -42,6 +42,8 @@ class ERA5WindSolarHourlyDataset(ERA5WindSolarBaseDataset):
         - The specific variables that are downloaded are:
             - 100m_u_component_of_wind
             - 100m_v_component_of_wind
+            - 10m_u_component_of_wind
+            - 10m_v_component_of_wind
             - 2m_temperature
             - 2m_dewpoint_temperature
             - runoff
@@ -61,6 +63,11 @@ class ERA5WindSolarHourlyDataset(ERA5WindSolarBaseDataset):
     variables = {
         "100m_u_component_of_wind": "u100",
         "100m_v_component_of_wind": "v100",
+        # 10 m wind for PV cell temperature (pvlib's temperature models are
+        # calibrated with ~10 m wind). Files downloaded before this was added
+        # lack u10/v10; see Pvlib's cooling-wind fallback.
+        "10m_u_component_of_wind": "u10",
+        "10m_v_component_of_wind": "v10",
         "2m_temperature": "t2m",
         "2m_dewpoint_temperature": "d2m",
         "runoff": "ro",

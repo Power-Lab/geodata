@@ -111,6 +111,15 @@ class ERA5WindSolarBaseDataset(ERA5BaseDataset):
         ds["wnd100m"] = wnd100m
         ds = ds.drop(["u100", "v100"])
 
+        # 10 m wind (added to the download in 2026; older files lack it).
+        # Used for PV cell temperature, whose models are calibrated near 10 m.
+        if "u10" in ds.data_vars and "v10" in ds.data_vars:
+            ds["wnd10m"] = np.sqrt(ds["u10"] ** 2 + ds["v10"] ** 2).assign_attrs(
+                units=ds["u10"].attrs.get("units", "m s**-1"),
+                long_name="10 metre wind speed",
+            )
+            ds = ds.drop_vars(["u10", "v10"])
+
         # Rename other variables
         ds = ds.rename(
             {

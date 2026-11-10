@@ -39,10 +39,12 @@ Example:
     >>> model.estimate(xs=slice(1, 2), ys=slice(1, 2), years=slice(2010, 2010), months=slice(1, 2))
 """
 
+import numpy as np
 import xarray as xr
 from scipy.interpolate import interp1d
 
-from ...resource import get_windturbineconfig
+from ...logging import logger
+from ...resource import resolve_windturbine
 from .._base import BaseModel
 
 HEIGHTS = {"u50m": 50, "u10m": 10, "u2m": 2}
@@ -101,28 +103,37 @@ class WindBaseModel(BaseModel):
 
     def _estimate_power(
         self,
-        turbine: str,
+        turbine: str | dict,
         xs: slice | None = None,
         ys: slice | None = None,
         years: slice | None = None,
         months: slice | None = None,
+        hour_average: bool = True,
     ) -> xr.DataArray:
-        """Estimate wind speed at the given locations and times.
+        """Estimate capacity factor (raw: no air-density or loss adjustment).
 
         Args:
-            turbine (str): Turbine name.
+            turbine (str | dict): A turbine YAML name in geodata's library, or a dict
+                defining a generic turbine by specific power or a specific model's
+                curve; see :func:`geodata.resource.resolve_windturbine`.
             xs (slice, optional): X slice. Defaults to None.
             ys (slice, optional): Y slice. Defaults to None.
             years (slice, optional): Year slice. Defaults to None.
             months (slice, optional): Month slice. Defaults to None.
+            hour_average (bool, optional): Report each hour as the average of the
+                instantaneous CF at the start and end of the hour (PLUSWIND), so the
+                value at a time stamp is the average over the hour ending at it.
+                ERA5 wind is instantaneous at each stamp; reported generation is an
+                hourly average. The first stamp has no preceding value and keeps its
+                instantaneous CF. Defaults to True.
 
         Returns:
-            xr.DataArray: Estimated wind speed.
+            xr.DataArray: Capacity factor named ``cf``.
         """
 
         # Get the wind turbine configuration
         try:
-            turbineconf = get_windturbineconfig(turbine)
+            turbineconf = resolve_windturbine(turbine)
         except FileNotFoundError:
             raise ValueError(f"Wind turbine configuration '{turbine}' not found.")
 
@@ -137,13 +148,39 @@ class WindBaseModel(BaseModel):
             fill_value=0.0,
         )
 
-        # Calculate the power output
+        # Calculate the power output. interp1d is already vectorised over arrays,
+        # so no per-element Python loop is needed.
         power = xr.apply_ufunc(
             interp_fn,
             speed,
-            vectorize=True,
             dask="parallelized",
             output_dtypes=[float],
         )
+        cf = power / turbineconf["P"]
 
-        return (power / turbineconf["P"]).rename("cf")
+        if hour_average and "time" in cf.dims and cf.sizes["time"] > 1:
+            step = np.diff(cf["time"].values[:2])[0]
+            if step == np.timedelta64(1, "h"):
+                cf = cf.rolling(time=2, min_periods=1).mean()
+            else:
+                logger.warning(
+                    "hour_average skipped: time step is %s, not 1 hour.", step
+                )
+                hour_average = False
+
+        cf = cf.rename("cf")
+        cf.attrs.update(
+            {
+                "long_name": "wind capacity factor (raw)",
+                "units": "1",
+                "hub_height_m": float(turbineconf["hub_height"]),
+                "turbine": turbine if isinstance(turbine, str) else str(turbine),
+                "hour_average": int(bool(hour_average)),
+                "time_convention": (
+                    "average over the hour ending at the stamp"
+                    if hour_average
+                    else "instantaneous at the stamp"
+                ),
+            }
+        )
+        return cf

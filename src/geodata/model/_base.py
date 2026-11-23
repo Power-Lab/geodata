@@ -29,6 +29,7 @@ from tqdm.auto import tqdm
 from ..config import model_dir
 from ..datasets._base import BaseDataset
 from ..logging import logger
+from ..utils import to_lon180
 from .results import DailyModelResult, MonthlyModelResult, ResultType
 
 if importlib.util.find_spec("h5netcdf") is not None:
@@ -316,6 +317,8 @@ class BaseModel(abc.ABC):
             f"estimate: Opening {len(files)} files with engine={engine}, parallel={parallel}"
         )
         params = xr.open_mfdataset(files, engine=engine, parallel=parallel)
+        # ERA5 files use 0-360 longitude; selections assume -180..180.
+        params = to_lon180(params, "x")
 
         if xs is not None:
             x_slice = (

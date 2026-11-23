@@ -40,6 +40,26 @@ def dummy_njit(f=None, *args, **kwargs):
     return decorator
 
 
+def to_lon180(ds, dim: str = "x"):
+    """Return ``ds`` with longitude ``dim`` in [-180, 180), sorted ascending.
+
+    ERA5 files on disk use 0-360 degree longitude, while every selection in
+    geodata (and every user ``xs`` slice) assumes -180..180. Without this,
+    a selection west of Greenwich (e.g. the USA, ``slice(-125, -66)``)
+    returns no data. Datasets already in -180..180 are returned unchanged.
+
+    Works for xarray Datasets and DataArrays, eager or dask-backed (the
+    re-sort is a lazy index operation).
+    """
+    if dim not in ds.coords:
+        return ds
+    lon = np.asarray(ds.coords[dim].values, dtype=float)
+    if lon.size == 0 or np.nanmax(lon) <= 180.0:
+        return ds
+    wrapped = ((lon + 180.0) % 360.0) - 180.0
+    return ds.assign_coords({dim: wrapped}).sortby(dim)
+
+
 def get_daterange(years: slice, months: slice):
     """Get the date range covering the entire years and months range.
 

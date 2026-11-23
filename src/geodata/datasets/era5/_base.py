@@ -19,6 +19,7 @@ import numpy as np
 import xarray as xr
 
 from geodata.types import CoordRange, PathLike
+from geodata.utils import to_lon180
 from .._base import BaseDataset
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,9 @@ def _convert_and_subset_lons_lats_era5(ds: xr.Dataset, xs: slice, ys: slice):
 
 
 def _subset_x_y_era5(ds: xr.Dataset, xs: slice, ys: slice):
-    # Subset x,y according to xs, ys
+    # Subset x,y according to xs, ys. Files on disk use 0-360 longitude while
+    # xs uses -180..180, so convert first (no-op for data already in -180..180).
+    ds = to_lon180(ds, "x")
 
     if not isinstance(xs, slice):
         first, second, last = np.asarray(xs)[[0, 1, -1]]

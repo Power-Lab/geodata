@@ -275,8 +275,43 @@ class WindInterpolationModel(WindBaseModel):
 
         return params
 
+    # Hub heights within this distance of the top downloaded level get a warning:
+    # the spline is poorly constrained near its end point.
+    TOP_LEVEL_MARGIN_M = 20.0
+
+    @classmethod
+    def check_height(cls, height: float, levels) -> str | None:
+        """Warn when ``height`` approaches or exceeds the top of ``levels`` (metres).
+
+        Returns the warning message, or None when the height is well inside.
+        """
+        top = float(np.max(levels))
+        bottom = float(np.min(levels))
+        msg = None
+        if height > top:
+            msg = (
+                f"Hub height {height:.1f} m is above the top downloaded level "
+                f"({top:.1f} m): wind speed is extrapolated beyond the data. "
+                "Download higher model levels or lower the hub height."
+            )
+        elif height > top - cls.TOP_LEVEL_MARGIN_M:
+            msg = (
+                f"Hub height {height:.1f} m is within {cls.TOP_LEVEL_MARGIN_M:.0f} m of "
+                f"the top downloaded level ({top:.1f} m), where the spline is poorly "
+                "constrained."
+            )
+        elif height < bottom:
+            msg = (
+                f"Height {height:.1f} m is below the lowest level ({bottom:.1f} m): "
+                "wind speed is extrapolated."
+            )
+        if msg:
+            logger.warning(msg)
+        return msg
+
     def _estimate_dataset(self, params: xr.Dataset, **kwargs) -> xr.DataArray:
         height = float(kwargs["height"])
+        self.check_height(height, params["height"].values)
         params = params.transpose("height", ...)
         params = cast(
             xr.Dataset,

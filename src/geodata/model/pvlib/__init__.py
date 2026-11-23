@@ -15,5 +15,7 @@
 
 from ._base import Pvlib
 from .calculations import latitude_optimal_orientation
+from .cooling_wind import model_level_wind
+from .plant import PlantSpec
 
-__all__ = ["Pvlib", "latitude_optimal_orientation"]
+__all__ = ["Pvlib", "PlantSpec", "latitude_optimal_orientation", "model_level_wind"]

@@ -42,6 +42,8 @@ class ERA5WindSolarMonthlyDataset(ERA5WindSolarHourlyDataset):
         - The specific variables that are downloaded are:
             - 100m_u_component_of_wind
             - 100m_v_component_of_wind
+            - 10m_u_component_of_wind
+            - 10m_v_component_of_wind
             - 2m_temperature
             - 2m_dew_point_temperature
             - runoff

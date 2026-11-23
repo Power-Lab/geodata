@@ -42,6 +42,88 @@ def calculate_pvlib_solarposition(ds: xr.Dataset) -> pd.DataFrame:
         solarposition.index = multi_index
     return solarposition
 
+def _solpos_flat(times: np.ndarray, lat: np.ndarray, lon: np.ndarray):
+    """Apparent and true zenith (degrees) for flat arrays of UTC times and coordinates."""
+    sp = get_solarposition(pd.DatetimeIndex(times), lat, lon)
+    return (
+        np.array(sp["apparent_zenith"], dtype=float),
+        np.array(sp["zenith"], dtype=float),
+    )
+
+
+def sun_position_offsets(
+    time,
+    lat,
+    lon,
+    mode: str = "mid_hour",
+    transition_band_deg: float = 10.0,
+    n_sub: int = 6,
+):
+    """Time at which to evaluate the sun's position for each hour, cell by cell.
+
+    ERA5 radiation at a time stamp is the average over the hour ending at the stamp,
+    so the sun's position should describe that hour, not the stamp itself
+    (Plan 4.3). With ``mode="mid_hour"`` the position is taken 30 minutes before
+    the stamp, as in atlite. In sunrise and sunset hours the sun is up for only
+    part of the hour, so the position is taken at the middle of the sunlit part
+    instead: the hour is sampled every ``60 / n_sub`` minutes and the sunlit
+    samples (apparent zenith below 90 degrees) are averaged. Only hours whose
+    mid-hour apparent zenith is within ``transition_band_deg`` of 90 degrees are
+    sampled; the sun moves at most 7.5 degrees in half an hour, so all other
+    hours are entirely day or night.
+
+    ``mode="stamp"`` reproduces geodata's earlier behaviour (position at the stamp).
+
+    Parameters
+    ----------
+    time : array of datetime64, shape (nt,)
+        Hour-ending time stamps in UTC.
+    lat, lon : arrays, shapes (ny,) and (nx,)
+        Cell-centre coordinates in degrees.
+
+    Returns
+    -------
+    offset_min, apparent_zenith, zenith : arrays of shape (nt, ny, nx)
+        Minutes before the stamp at which the position is evaluated, and the
+        apparent and true solar zenith (degrees) at that time.
+    """
+    time = np.asarray(time, dtype="datetime64[ns]")
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    shape = (time.size, lat.size, lon.size)
+    t = np.broadcast_to(time[:, None, None], shape).ravel()
+    la = np.broadcast_to(lat[None, :, None], shape).ravel()
+    lo = np.broadcast_to(lon[None, None, :], shape).ravel()
+
+    def minutes(m):
+        return (np.asarray(m, dtype=float) * 60e9).astype("timedelta64[ns]")
+
+    if mode == "stamp":
+        offset = np.zeros(t.size)
+        app, zen = _solpos_flat(t, la, lo)
+    elif mode == "mid_hour":
+        offset = np.full(t.size, 30.0)
+        app, zen = _solpos_flat(t - minutes(30.0), la, lo)
+        tr = np.abs(app - 90.0) < transition_band_deg
+        if tr.any():
+            before = 60.0 - (np.arange(n_sub) + 0.5) * 60.0 / n_sub  # e.g. 55, 45, ..., 5
+            up = np.zeros((n_sub, int(tr.sum())), dtype=bool)
+            for k, m in enumerate(before):
+                a, _ = _solpos_flat(t[tr] - minutes(m), la[tr], lo[tr])
+                up[k] = a < 90.0
+            n_up = up.sum(axis=0)
+            eff = np.where(
+                n_up > 0, (before[:, None] * up).sum(axis=0) / np.maximum(n_up, 1), 30.0
+            )
+            offset[tr] = eff
+            a, z = _solpos_flat(t[tr] - minutes(eff), la[tr], lo[tr])
+            app[tr], zen[tr] = a, z
+    else:
+        raise ValueError(f"sun_position must be 'mid_hour' or 'stamp', got {mode!r}")
+
+    return offset.reshape(shape), app.reshape(shape), zen.reshape(shape)
+
+
 def calculate_ghi(
     ds: xr.Dataset, 
     zenith: pd.Series

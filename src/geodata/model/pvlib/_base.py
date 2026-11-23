@@ -30,6 +30,7 @@ the weather-data preparation helpers in ``calculations.py``).
 """
 import os
 import platform
+import numpy as np
 import pandas as pd
 import xarray as xr
 import time
@@ -41,7 +42,9 @@ from timezonefinder import TimezoneFinder
 
 from .._base import BaseModel, _normalize_slice_for_sel, _should_use_parallel_reading
 from geodata.logging import logger
-from .calculations import calculate_pvlib_solarposition, calculate_dni, calculate_ghi, calculate_relative_humidity, calculate_precipitable_water, convert_kelvin_to_celsius
+from geodata.utils import to_lon180
+from .calculations import calculate_pvlib_solarposition, calculate_dni, calculate_ghi, calculate_relative_humidity, calculate_precipitable_water, convert_kelvin_to_celsius, sun_position_offsets
+from .plant import PlantSpec
 from tqdm.auto import tqdm
 
 
@@ -385,27 +388,69 @@ def _process_single_coordinate(args):
     try:
         # Extract subset for this coordinate
         subset = weather_data.loc[(slice(None), y, x), :].reset_index(['x', 'y'])
-        
-        # Get timezone
-        tz_str = TimezoneFinder().timezone_at(lat=y, lng=x)
-        if tz_str is None:
-            raise ValueError(f"Timezone not found for coordinates ({y}, {x})")
-        
-        # Create location
-        location = Location(latitude=y, longitude=x, tz=tz_str)  # type: ignore[arg-type]
-        
-        # Create and run ModelChain
-        mc = ModelChain(
-            system,
-            location,
-            **model_chain_kwargs
-        )
-        mc.run_model(subset)
-        
-        # Calculate outputs
-        subset['ac'] = mc.results.ac
-        subset.loc[subset['ac'] < 0, 'ac'] = 0
-        subset['pv'] = subset['ac'] / (ptc * n_mods)
+
+        if isinstance(system, PlantSpec):
+            # New path: one configuration, system built for this cell's latitude
+            # (latitude-optimal tilt), sun position at the effective time, site
+            # elevation and ERA5 albedo, CF on AC and DC nameplates.
+            spec = system
+            cell_system = spec.system_for(y)
+            altitude = 0.0
+            if 'altitude' in subset.columns:
+                altitude = float(np.nan_to_num(subset['altitude'].iloc[0], nan=0.0))
+            location = Location(latitude=y, longitude=x, tz='UTC', altitude=altitude)
+            stamps = pd.DatetimeIndex(subset.index)
+            offset = subset['sun_offset_min'].to_numpy() if 'sun_offset_min' in subset.columns else 0.0
+            weather = subset.drop(
+                columns=[c for c in ('altitude', 'sun_offset_min') if c in subset.columns]
+            )
+            if 'albedo' in weather.columns:
+                weather['albedo'] = weather['albedo'].clip(0.0, 1.0).fillna(0.25)
+            # Times are UTC; the sun position is evaluated `offset` minutes before
+            # each stamp (mid-hour, or the middle of the sunlit part of the hour).
+            eff = stamps.tz_localize('UTC') if stamps.tz is None else stamps.tz_convert('UTC')
+            weather.index = eff - pd.to_timedelta(offset, unit='min')
+            mc = ModelChain(cell_system, location, **model_chain_kwargs)
+            mc.run_model(weather)
+            ac = np.clip(np.asarray(mc.results.ac, dtype=float), 0.0, None)
+            subset['ac'] = ac
+            subset['cf_ac'] = ac / spec.ac_nameplate_w
+            subset['cf_dc'] = ac / spec.dc_nameplate_w
+            out_cols = ['ac', 'cf_ac', 'cf_dc']
+        else:
+            # Legacy path (init_pv_system): one PVSystem for every cell.
+            # Get timezone
+            tz_str = TimezoneFinder().timezone_at(lat=y, lng=x)
+            if tz_str is None:
+                raise ValueError(f"Timezone not found for coordinates ({y}, {x})")
+
+            # Create location
+            location = Location(latitude=y, longitude=x, tz=tz_str)  # type: ignore[arg-type]
+
+            # Create and run ModelChain
+            mc = ModelChain(
+                system,
+                location,
+                **model_chain_kwargs
+            )
+            weather = subset.drop(
+                columns=[c for c in ('altitude', 'sun_offset_min', 'albedo') if c in subset.columns]
+            )
+            if 'sun_offset_min' in subset.columns:
+                stamps = pd.DatetimeIndex(subset.index)
+                eff = stamps.tz_localize('UTC') if stamps.tz is None else stamps.tz_convert('UTC')
+                weather.index = eff - pd.to_timedelta(subset['sun_offset_min'].to_numpy(), unit='min')
+            mc.run_model(weather)
+
+            # Calculate outputs. `pv` keeps the legacy PTC basis; cf_ac / cf_dc use
+            # the inverter AC rating and the modules' STC rating.
+            subset['ac'] = np.asarray(mc.results.ac, dtype=float)
+            subset.loc[subset['ac'] < 0, 'ac'] = 0
+            subset['pv'] = subset['ac'] / (ptc * n_mods)
+            arr = system.arrays[0]
+            subset['cf_ac'] = subset['ac'] / float(system.inverter_parameters['Paco'])
+            subset['cf_dc'] = subset['ac'] / (float(arr.module_parameters['STC']) * n_mods)
+            out_cols = ['ac', 'pv', 'cf_ac', 'cf_dc']
         
         # Update progress if progress_dict is provided
         if progress_dict is not None:
@@ -436,7 +481,7 @@ def _process_single_coordinate(args):
         # `subset` is currently indexed only by `time` (x/y were reset into columns),
         # which would otherwise cause the output to have only `time` as a coordinate.
         if compact_output:
-            subset_out = subset[['ac', 'pv']].copy()
+            subset_out = subset[out_cols].copy()
         else:
             subset_out = subset.copy()
         subset_out = subset_out.assign(y=y, x=x)
@@ -602,6 +647,53 @@ class Pvlib(BaseModel):
         """
         self.pv_system = pvsystem.PVSystem(*args, **kwargs)
 
+    def init_plant(
+        self,
+        module_parameters,
+        inverter_parameters,
+        dc_ac_ratio: float = 1.25,
+        mount: str = "fixed",
+        tilt: float | str = "latitude_optimal",
+        azimuth: float | str = "equator",
+        **kwargs,
+    ) -> PlantSpec:
+        """Define one PV configuration, built into a pvlib system cell by cell.
+
+        Unlike :meth:`init_pv_system` (one fixed system for every cell), this
+        builds each cell's system from its latitude, so fixed mounts can use the
+        latitude-optimal tilt facing the equator in every cell, in either
+        hemisphere. Output CF is relative to the inverter AC rating (``cf_ac``)
+        and to the modules' STC rating (``cf_dc``); ``cf_dc = cf_ac / DC/AC``.
+
+        Args:
+            module_parameters: CEC module parameters (e.g. a row of
+                ``retrieve_sam("CECMod")``).
+            inverter_parameters: Sandia/CEC inverter parameters; scaled to reach
+                ``dc_ac_ratio`` (see :mod:`geodata.model.pvlib.plant`).
+            dc_ac_ratio: DC (module STC) to AC (inverter) nameplate ratio.
+            mount: ``"fixed"`` or ``"single_axis"`` (north-south axis, backtracking).
+            tilt: ``"latitude_optimal"`` (per cell, gsee rule) or degrees.
+            azimuth: ``"equator"`` (180 north of the equator, 0 south of it) or degrees.
+            **kwargs: Further :class:`~geodata.model.pvlib.plant.PlantSpec` fields:
+                ``gcr`` (0.4), ``max_angle`` (45), ``backtrack`` (True),
+                ``axis_tilt`` (0), ``axis_azimuth`` (180), ``modules_per_string``
+                (auto from inverter voltages), ``module_type`` ("glass_polymer"),
+                ``racking_model`` ("open_rack"), ``temperature_model_parameters``.
+
+        Returns:
+            The :class:`PlantSpec`, also stored as ``self.plant``.
+        """
+        self.plant = PlantSpec(
+            module_parameters=module_parameters,
+            inverter_parameters=inverter_parameters,
+            dc_ac_ratio=dc_ac_ratio,
+            mount=mount,
+            tilt=tilt,
+            azimuth=azimuth,
+            **kwargs,
+        )
+        return self.plant
+
 
     def _estimate_dataset(self, params: xr.Dataset, **kwargs) -> xr.Dataset | xr.DataArray:  # type: ignore[override]
         """Estimate PV output from prepared dataset.
@@ -615,11 +707,15 @@ class Pvlib(BaseModel):
         """
 
         compact_output = kwargs.get("compact_output", True)
+        plant = getattr(self, "plant", None)
+        system = plant if plant is not None else self.pv_system
         result = self._pvlib_model(
             params,
-            self.pv_system,
+            system,
             self.config,
             compact_output=compact_output,
+            sun_position=kwargs.get("sun_position", "mid_hour"),
+            cooling_wind=kwargs.get("cooling_wind"),
         )
         return result
     
@@ -629,27 +725,40 @@ class Pvlib(BaseModel):
         xs: slice | None = None,
         ys: slice | None = None,
         compact_output: bool = True,
+        sun_position: str = "mid_hour",
+        cooling_wind: xr.DataArray | None = None,
         **kwargs,
         ) -> xr.DataArray:
             """Get pvlib model results.
-            
+
             This method processes data month-by-month to avoid memory issues with large datasets.
             Results from each month are concatenated along the time dimension.
-            
+
             Args:
                 years: Year range (slice)
                 months: Month range (slice)
                 xs: X-coordinate range (slice)
                 ys: Y-coordinate range (slice)
-                compact_output: If True (default), return only `ac` and `pv`
-                    as data variables. If False, keep full per-coordinate output.
+                compact_output: If True (default), return only the output
+                    variables (``ac``, ``cf_ac``, ``cf_dc``; plus legacy ``pv`` for
+                    :meth:`init_pv_system` runs). If False, keep full
+                    per-coordinate output.
+                sun_position: ``"mid_hour"`` (default) evaluates the sun's
+                    position at the middle of the hour each radiation value
+                    describes (the sunlit part of sunrise and sunset hours);
+                    ``"stamp"`` uses the time stamp (geodata's earlier behaviour).
+                cooling_wind: Optional wind speed (m/s, dims time/y/x on the same
+                    grid) for the cell-temperature model, e.g. ERA5's lowest model
+                    level from :func:`model_level_wind`. Without it, ERA5 10 m wind
+                    is used when the files have it, else 100 m wind with a warning.
                 **kwargs: Additional parameters
-            
+
             Returns:
-                Dataset with AC power and PV capacity, concatenated across all months
+                Dataset with AC output and capacity factors, concatenated across all months
             """
-            if getattr(self, 'pv_system', None) is None:
-                raise ValueError("pv_system is not initialized. Call init_pv_system() first.")
+            if getattr(self, 'plant', None) is None and getattr(self, 'pv_system', None) is None:
+                raise ValueError("No PV system defined. Call init_plant() (or the legacy init_pv_system()) first.")
+            kwargs.update(sun_position=sun_position, cooling_wind=cooling_wind)
             if getattr(self, 'config', None) is None:
                 raise ValueError("model_config is not initialized. Call init_model_config() first.")
             
@@ -719,7 +828,9 @@ class Pvlib(BaseModel):
                     
                     if rename_dict:
                         params = params.rename(rename_dict)
-                    
+                    # ERA5 files use 0-360 longitude; selections assume -180..180.
+                    params = to_lon180(params, "x")
+
                     # Apply spatial filtering if specified.
                     # Normalize slice order for descending coordinates (e.g. ERA5 latitude);
                     # otherwise .sel() returns empty.
@@ -772,9 +883,34 @@ class Pvlib(BaseModel):
             desired_order = ("time", "x", "y")
             if all(d in combined_result.dims for d in desired_order):
                 combined_result = combined_result.transpose(*desired_order)
+
+            attrs = {
+                "sun_position": sun_position,
+                "cooling_wind": getattr(self, "_cooling_wind_source", "unknown"),
+                "time_convention": "average over the hour ending at the stamp (UTC)",
+                "losses": "none (raw CF)",
+            }
+            plant = getattr(self, "plant", None)
+            if plant is not None:
+                attrs.update({f"pv_{k}": v for k, v in plant.describe().items()})
+            combined_result.attrs.update(attrs)
+            for var, desc in (
+                ("cf_ac", "AC output / inverter AC rating"),
+                ("cf_dc", "AC output / module STC (DC) rating"),
+                ("ac", "AC output (W) of the simulated plant"),
+            ):
+                if var in combined_result:
+                    combined_result[var].attrs["long_name"] = desc
             return combined_result
         
-    def _prepare_pvlib_ds(self, ds: xr.Dataset, *varnames: str) -> xr.Dataset:
+    def _prepare_pvlib_ds(
+        self,
+        ds: xr.Dataset,
+        *varnames: str,
+        sun_position: str = "stamp",
+        cooling_wind: xr.DataArray | None = None,
+        extras: bool = False,
+    ) -> xr.Dataset:
         """
         Prepares an `xarray.Dataset` from a geodata `cutout` class for use in model simulations using `pvlib`.
         This function extracts specified variables from the `cutout` dataset, calculates additional parameters 
@@ -850,12 +986,42 @@ class Pvlib(BaseModel):
             relative_humidity
         )
 
-        sp = calculate_pvlib_solarposition(ds)
-        ghi = calculate_ghi(ds, sp['zenith'])
+        ds = ds.transpose("time", "y", "x", ...)
+        if sun_position == "stamp" and not extras:
+            sp = calculate_pvlib_solarposition(ds)
+            zenith = sp['zenith']
+            offset = None
+        else:
+            offset, _, zenith = sun_position_offsets(
+                ds['time'].values, ds['y'].values, ds['x'].values, mode=sun_position
+            )
+            zenith = zenith.ravel()
+        ghi = calculate_ghi(ds, zenith)
         # ERA5's influx_direct (fdir) is the direct irradiance on a HORIZONTAL
         # plane, not the direct normal irradiance ModelChain expects: derive
         # true DNI = BHI / cos(zenith) instead of renaming fdir to 'dni'.
-        dni = calculate_dni(ds, sp['zenith'])
+        dni = calculate_dni(ds, zenith)
+
+        # Wind for the cell-temperature model, calibrated near 10 m (Plan 4.1/4.3).
+        if cooling_wind is not None:
+            cw = cooling_wind
+            if "valid_time" in cw.dims:
+                cw = cw.rename({"valid_time": "time"})
+            wind_speed = cw.sel(time=ds["time"], y=ds["y"], x=ds["x"], method="nearest", tolerance=1e-3)
+            wind_speed = wind_speed.assign_coords(time=ds["time"], y=ds["y"], x=ds["x"])
+            self._cooling_wind_source = cooling_wind.attrs.get("source", "user-supplied")
+        elif "wnd10m" in ds.data_vars:
+            wind_speed = ds["wnd10m"]
+            self._cooling_wind_source = "ERA5 10 m wind"
+        else:
+            wind_speed = ds["wnd100m"]
+            self._cooling_wind_source = "ERA5 100 m wind (fallback)"
+            if extras:
+                logger.warning(
+                    "No 10 m wind available: using 100 m wind for PV cell temperature, "
+                    "which overstates panel cooling. Pass cooling_wind (e.g. ERA5's lowest "
+                    "model level via geodata.model.pvlib.model_level_wind) or download u10/v10."
+                )
 
         ds = (
             ds
@@ -863,24 +1029,32 @@ class Pvlib(BaseModel):
                 ghi=ghi,
                 dni=dni,
                 temperature=temperature_celsius,
-                precipitable_water=precipitable_water
+                precipitable_water=precipitable_water,
+                wind_speed=wind_speed.transpose("time", "y", "x"),
             )
             .drop_vars('influx_direct')
             .rename({
                 'influx_diffuse': 'dhi',
                 'temperature': 'temp_air',
-                'wnd100m': 'wind_speed'
             })
         )
 
-        result = ds[[
-            "dhi", 
-            "dni",
-            "ghi", 
-            "temp_air", 
-            "wind_speed", 
-            "precipitable_water"
-        ]]
+        cols = ["dhi", "dni", "ghi", "temp_air", "wind_speed", "precipitable_water"]
+        if extras:
+            # Per-hour sun-position offset, ERA5 albedo and site elevation, used
+            # by the per-cell ModelChain in the init_plant path.
+            ds["sun_offset_min"] = (("time", "y", "x"), offset)
+            cols.append("sun_offset_min")
+            if "albedo" in ds.data_vars:
+                cols.append("albedo")
+            if "height" in ds.data_vars:
+                ds["altitude"] = ds["height"].broadcast_like(ds["ghi"])
+                cols.append("altitude")
+        elif offset is not None:
+            ds["sun_offset_min"] = (("time", "y", "x"), offset)
+            cols.append("sun_offset_min")
+
+        result = ds[cols]
         
         prepare_time = time.time() - prepare_start
         logger.info(f"_prepare_pvlib_ds: {prepare_time:.2f}s")
@@ -895,8 +1069,10 @@ class Pvlib(BaseModel):
         vars: list[str] = ["influx_diffuse", "influx_direct", "dewpoint_temperature", "temperature", "wnd100m"],
         n_jobs: int | None = None,
         compact_output: bool = True,
+        sun_position: str = "stamp",
+        cooling_wind: xr.DataArray | None = None,
     ) -> xr.Dataset:
-        
+
         """
         Applies a `pvlib` model using :code:`pvlib.modelchain.ModelChain()` across all unique coordinates 
         represented in a `geodata` cutout. This function prepares input weather data, initializes the 
@@ -981,16 +1157,29 @@ class Pvlib(BaseModel):
             Dataset containing ac power output and pv capacity across all coordinates in the cutout.
 
         """
-        ptc = system.arrays[0].module_parameters['PTC']
-        # Nameplate normalization must count EVERY module feeding the
-        # inverter: pvlib's Array wires `strings` strings of
-        # `modules_per_string` modules in parallel, and mc.results.ac is the
-        # whole inverter's AC output. Dividing by modules_per_string alone
-        # overstated `pv` by the strings_per_inverter factor (e.g. 4x for a
-        # 4-string system).
-        n_mods = system.arrays[0].modules_per_string * system.arrays[0].strings
+        is_plant = isinstance(system, PlantSpec)
+        if is_plant:
+            ptc = n_mods = None
+        else:
+            ptc = system.arrays[0].module_parameters['PTC']
+            # Nameplate normalization must count EVERY module feeding the
+            # inverter: pvlib's Array wires `strings` strings of
+            # `modules_per_string` modules in parallel, and mc.results.ac is the
+            # whole inverter's AC output. Dividing by modules_per_string alone
+            # overstated `pv` by the strings_per_inverter factor (e.g. 4x for a
+            # 4-string system).
+            n_mods = system.arrays[0].modules_per_string * system.arrays[0].strings
 
-        weather_data = self._prepare_pvlib_ds(ds, *vars).to_dataframe()
+        # Optional inputs: 10 m wind (cell cooling), and for plants the ERA5
+        # albedo and surface height.
+        optional = ["wnd10m"] + (["albedo", "height"] if is_plant else [])
+        vars = list(vars) + [v for v in optional if v in ds.data_vars and v not in vars]
+        weather_data = self._prepare_pvlib_ds(
+            ds, *vars,
+            sun_position=sun_position,
+            cooling_wind=cooling_wind,
+            extras=is_plant,
+        ).to_dataframe()
         unique_coords = weather_data.index.droplevel('time').drop_duplicates()
         total_coords = len(unique_coords)
         

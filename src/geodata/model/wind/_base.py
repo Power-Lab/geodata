@@ -109,8 +109,9 @@ class WindBaseModel(BaseModel):
         years: slice | None = None,
         months: slice | None = None,
         hour_average: bool = True,
+        air_density: xr.Dataset | xr.DataArray | None = None,
     ) -> xr.DataArray:
-        """Estimate capacity factor (raw: no air-density or loss adjustment).
+        """Estimate capacity factor (no losses).
 
         Args:
             turbine (str | dict): A turbine YAML name in geodata's library, or a dict
@@ -126,6 +127,13 @@ class WindBaseModel(BaseModel):
                 ERA5 wind is instantaneous at each stamp; reported generation is an
                 hourly average. The first stamp has no preceding value and keeps its
                 instantaneous CF. Defaults to True.
+            air_density (xr.Dataset | xr.DataArray, optional): Air-density adjustment
+                (Plan 4.2): wind speed is scaled by (rho / 1.225) ** (1/3) before the
+                power curve. Pass a Dataset with ERA5 ``sp`` (Pa) and ``t2m`` (K), e.g.
+                from :func:`geodata.model.wind.surface_pressure_temperature`, to
+                estimate rho at hub height, or a DataArray of rho (kg/m3). Dims
+                (time, y, x); time stamps must cover those of the wind data. None (the
+                default) applies no adjustment and records that in the attributes.
 
         Returns:
             xr.DataArray: Capacity factor named ``cf``.
@@ -140,6 +148,22 @@ class WindBaseModel(BaseModel):
         speed = self.estimate(
             years=years, months=months, xs=xs, ys=ys, height=turbineconf["hub_height"]
         )
+
+        density_note = "none"
+        if air_density is not None:
+            from .density import RHO_STD, align_to, hub_air_density
+
+            if isinstance(air_density, xr.Dataset):
+                rho = hub_air_density(
+                    air_density["sp"], air_density["t2m"], turbineconf["hub_height"]
+                )
+            else:
+                rho = air_density
+            rho = align_to(rho, speed).transpose(*speed.dims)
+            speed = speed * (rho / RHO_STD) ** (1.0 / 3.0)
+            density_note = "IEC 61400-12-1: speed x (rho/1.225)^(1/3); " + str(
+                rho.attrs.get("source", "user-supplied rho")
+            )
 
         interp_fn = interp1d(
             turbineconf["V"],
@@ -171,7 +195,8 @@ class WindBaseModel(BaseModel):
         cf = cf.rename("cf")
         cf.attrs.update(
             {
-                "long_name": "wind capacity factor (raw)",
+                "long_name": "wind capacity factor (no losses)",
+                "air_density": density_note,
                 "units": "1",
                 "hub_height_m": float(turbineconf["hub_height"]),
                 "turbine": turbine if isinstance(turbine, str) else str(turbine),

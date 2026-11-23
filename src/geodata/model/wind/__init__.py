@@ -15,5 +15,11 @@
 
 from .extrapolate import WindExtrapolationModel
 from .interpolate import WindInterpolationModel
+from .density import hub_air_density, surface_pressure_temperature
 
-__all__ = ["WindExtrapolationModel", "WindInterpolationModel"]
+__all__ = [
+    "WindExtrapolationModel",
+    "WindInterpolationModel",
+    "hub_air_density",
+    "surface_pressure_temperature",
+]
